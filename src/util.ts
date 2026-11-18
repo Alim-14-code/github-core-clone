@@ -1,105 +1,197 @@
-// Small shared helpers: hashing, pkt-line framing, HTTP request/response plumbing.
-// Node standard library only (node:crypto, node:zlib, node:http).
+// Shared low-level helpers for the forge: git hashing, pkt-line framing, and
+// the small HTTP plumbing every endpoint leans on. Standard library only.
 
 import { createHash } from 'node:crypto';
-import { inflateSync, deflateSync } from 'node:zlib';
+import { deflateSync, inflateSync } from 'node:zlib';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
+/** Content type used for every JSON answer we send. */
 export const JSON_TYPE = 'application/json; charset=utf-8';
 
-/** SHA-1 hex of a buffer (git object ids). */
+// ---------------------------------------------------------------------------
+// Hashing and compression
+// ---------------------------------------------------------------------------
+
+/** Hex SHA-1 digest of some bytes; the basis of every git object id. */
 export function sha1(data: Buffer): string {
-  return createHash('sha1').update(data).digest('hex');
+  const hash = createHash('sha1');
+  hash.update(data);
+  return hash.digest('hex');
 }
 
-/** The git object id of a "<type> <size>\0<content>" object. */
+/** The object id of a git object: sha1 of "<type> <size>\0" + content. */
 export function objectId(type: string, content: Buffer): string {
   const header = Buffer.from(`${type} ${content.length}\0`, 'ascii');
-  return sha1(Buffer.concat([header, content]));
+  const framed = Buffer.concat([header, content]);
+  return sha1(framed);
 }
 
-/** zlib-inflate a buffer (loose objects, pack entries). */
+/** Inflate zlib-compressed bytes (loose objects and pack entries). */
 export function inflate(data: Buffer): Buffer {
   return inflateSync(data);
 }
 
-/** zlib-deflate a buffer (pack entries, loose objects). */
+/** Deflate bytes with zlib (pack entries and loose objects). */
 export function deflate(data: Buffer, level = 6): Buffer {
   return deflateSync(data, { level });
 }
 
-/** Encode one pkt-line: 4 hex length digits + payload (length includes the 4 digits). */
+// ---------------------------------------------------------------------------
+// pkt-line framing (git smart HTTP)
+// ---------------------------------------------------------------------------
+
+/** Encode a single pkt-line: four hex digits of length (self-inclusive) + body. */
 export function pktLine(payload: Buffer | string): Buffer {
   const body = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : payload;
-  const len = body.length + 4;
-  return Buffer.concat([Buffer.from(len.toString(16).padStart(4, '0'), 'ascii'), body]);
+  const totalLength = body.length + 4;
+  const lengthPrefix = totalLength.toString(16).padStart(4, '0');
+  return Buffer.concat([Buffer.from(lengthPrefix, 'ascii'), body]);
 }
 
-/** The pkt-line flush packet ("0000"). */
+/** The flush packet: the four bytes "0000". */
 export const FLUSH = Buffer.from('0000', 'ascii');
 
-/** The pkt-line delimiter packet ("0001") used by protocol v2. */
+/** The delimiter packet ("0001") used in protocol v2 responses. */
 export const DELIM = Buffer.from('0001', 'ascii');
 
-/** The pkt-line response-end packet ("0002") used by protocol v2. */
+/** The response-end packet ("0002") used in protocol v2 responses. */
 export const RESPONSE_END = Buffer.from('0002', 'ascii');
 
+/** What one pkt-line decodes to: raw payload, or a named control packet. */
+export type PktLine = Buffer | 'FLUSH' | 'DELIM' | 'END';
+
+const FLUSH_PACKET = 0;
+const DELIM_PACKET = 1;
+const END_PACKET = 2;
+
 /**
- * Split a buffer of pkt-lines into payloads. Returns the payloads and the offset just past the
- * last complete line; a trailing flush (0000) yields a null entry, a delimiter (0001) yields the
- * string 'DELIM', a response-end (0002) yields 'END'. Throws on a truncated line.
+ * Decode a buffer of pkt-lines. Control packets become the strings 'FLUSH',
+ * 'DELIM' and 'END'. Throws when a length header or a payload is cut short,
+ * or when the length header is not a number.
  */
-export function readPktLines(buf: Buffer): Array<Buffer | 'FLUSH' | 'DELIM' | 'END'> {
-  const out: Array<Buffer | 'FLUSH' | 'DELIM' | 'END'> = [];
-  let off = 0;
-  while (off < buf.length) {
-    if (off + 4 > buf.length) throw new Error('truncated pkt-line length');
-    const len = parseInt(buf.subarray(off, off + 4).toString('ascii'), 16);
-    if (!Number.isFinite(len) || len < 0) throw new Error('bad pkt-line length');
-    if (len === 0) {
-      out.push('FLUSH');
-      off += 4;
-    } else if (len === 1) {
-      out.push('DELIM');
-      off += 4;
-    } else if (len === 2) {
-      out.push('END');
-      off += 4;
+export function readPktLines(buf: Buffer): Array<PktLine> {
+  const lines: Array<PktLine> = [];
+  let cursor = 0;
+  while (cursor < buf.length) {
+    if (cursor + 4 > buf.length) {
+      throw new Error('truncated pkt-line length');
+    }
+    const rawLength = buf.subarray(cursor, cursor + 4).toString('ascii');
+    const length = parseInt(rawLength, 16);
+    if (!Number.isFinite(length) || length < 0) {
+      throw new Error('bad pkt-line length');
+    }
+    cursor += 4;
+    if (length === FLUSH_PACKET) {
+      lines.push('FLUSH');
+    } else if (length === DELIM_PACKET) {
+      lines.push('DELIM');
+    } else if (length === END_PACKET) {
+      lines.push('END');
     } else {
-      if (off + len > buf.length) throw new Error('truncated pkt-line');
-      out.push(buf.subarray(off + 4, off + len));
-      off += len;
+      const payloadLength = length - 4;
+      if (cursor + payloadLength > buf.length) {
+        throw new Error('truncated pkt-line');
+      }
+      lines.push(buf.subarray(cursor, cursor + payloadLength));
+      cursor += payloadLength;
     }
   }
-  return out;
+  return lines;
 }
 
-/** Read a request body fully (Buffer). Rejects over `maxBytes` (default 256 MiB). */
+// ---------------------------------------------------------------------------
+// HTTP request helpers
+// ---------------------------------------------------------------------------
+
+/** Slurp a request body into a Buffer; rejects past `maxBytes` (default 256 MiB). */
 export function readBody(req: IncomingMessage, maxBytes = 256 * 1024 * 1024): Promise<Buffer> {
   return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    let total = 0;
+    const pieces: Buffer[] = [];
+    let seen = 0;
+    let settled = false;
+    const fail = (err: Error): void => {
+      if (!settled) {
+        settled = true;
+        reject(err);
+      }
+    };
     req.on('data', (chunk: Buffer) => {
-      total += chunk.length;
-      if (total > maxBytes) {
-        reject(new Error('request body too large'));
+      seen += chunk.length;
+      if (seen > maxBytes) {
+        fail(new Error('request body too large'));
         req.destroy();
         return;
       }
-      chunks.push(chunk);
+      pieces.push(chunk);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', reject);
+    req.on('end', () => {
+      if (!settled) {
+        settled = true;
+        resolve(Buffer.concat(pieces));
+      }
+    });
+    req.on('error', fail);
   });
 }
 
-/** Parse a JSON body; returns null when the body is empty, throws on malformed JSON. */
+/**
+ * Parse a JSON request body. An empty body parses to null; malformed JSON
+ * throws the usual SyntaxError from JSON.parse.
+ */
 export function parseJsonBody(buf: Buffer): unknown {
   const text = buf.toString('utf8').trim();
-  if (text === '') return null;
+  if (text.length === 0) return null;
   return JSON.parse(text);
 }
 
+/** The path portion of a request URL; '/' when the URL will not parse. */
+export function pathOf(req: IncomingMessage): string {
+  try {
+    return new URL(req.url ?? '/', 'http://entry').pathname;
+  } catch {
+    return '/';
+  }
+}
+
+/** The query parameters of a request URL; empty when the URL will not parse. */
+export function queryOf(req: IncomingMessage): URLSearchParams {
+  try {
+    return new URL(req.url ?? '/', 'http://entry').searchParams;
+  } catch {
+    return new URLSearchParams();
+  }
+}
+
+/** Percent-decode a single path segment; null when the escape is invalid. */
+export function decodeSegment(segment: string): string | null {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * True when the request presents the suite's bearer token. When no token is
+ * configured in the environment, any non-empty bearer token is accepted.
+ */
+export function isAuthorized(req: IncomingMessage): boolean {
+  const header = req.headers.authorization ?? '';
+  const bearer = /^Bearer\s+(.+)$/.exec(header);
+  if (bearer === null) return false;
+  const presented = bearer[1].trim();
+  if (presented === '') return false;
+  const expected = (process.env.MAKEFUN_SHOP_TOKEN ?? '').trim();
+  if (expected === '') return true;
+  return presented === expected;
+}
+
+// ---------------------------------------------------------------------------
+// HTTP response helpers and error plumbing
+// ---------------------------------------------------------------------------
+
+/** A small error carrier: an HTTP status plus a human-readable message. */
 export interface HttpError {
   status: number;
   message: string;
@@ -110,66 +202,42 @@ export function httpError(status: number, message: string): HttpError {
 }
 
 export function isHttpError(value: unknown): value is HttpError {
-  return (
-    typeof value === 'object' &&
-    value !== null &&
-    typeof (value as HttpError).status === 'number' &&
-    typeof (value as HttpError).message === 'string'
-  );
+  if (typeof value !== 'object' || value === null) return false;
+  const candidate = value as HttpError;
+  return typeof candidate.status === 'number' && typeof candidate.message === 'string';
 }
 
-/** Send a JSON response. `extraHeaders` go beside content-type and content-length. */
-export function sendJson(res: ServerResponse, status: number, body: unknown, extraHeaders: Record<string, string> = {}): void {
+/**
+ * Answer with JSON. `extraHeaders` are merged beside content-type and
+ * content-length. The body is always terminated with a newline.
+ */
+export function sendJson(
+  res: ServerResponse,
+  status: number,
+  body: unknown,
+  extraHeaders: Record<string, string> = {},
+): void {
   const text = `${JSON.stringify(body)}\n`;
-  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(text), ...extraHeaders });
+  const headers: Record<string, string> = {
+    'content-type': JSON_TYPE,
+    'content-length': String(Buffer.byteLength(text)),
+    ...extraHeaders,
+  };
+  res.writeHead(status, headers);
   res.end(text);
 }
 
-/** Send a JSON error body `{message}`. */
-export function sendError(res: ServerResponse, status: number, message: string, extraHeaders: Record<string, string> = {}): void {
+/** Answer with a JSON `{message}` error body. */
+export function sendError(
+  res: ServerResponse,
+  status: number,
+  message: string,
+  extraHeaders: Record<string, string> = {},
+): void {
   sendJson(res, status, { message }, extraHeaders);
 }
 
-/** The path of a request URL, or '/' when it does not parse. */
-export function pathOf(req: IncomingMessage): string {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
-  } catch {
-    return '/';
-  }
-}
-
-/** Query parameters of a request URL. */
-export function queryOf(req: IncomingMessage): URLSearchParams {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').searchParams;
-  } catch {
-    return new URLSearchParams();
-  }
-}
-
-/** Percent-decode one path segment; returns null on a bad escape. */
-export function decodeSegment(segment: string): string | null {
-  try {
-    return decodeURIComponent(segment);
-  } catch {
-    return null;
-  }
-}
-
-/** True when the request carries the suite's bearer token. */
-export function isAuthorized(req: IncomingMessage): boolean {
-  const header = req.headers.authorization ?? '';
-  const match = /^Bearer\s+(.+)$/.exec(header);
-  if (match === null) return false;
-  const token = match[1].trim();
-  if (token === '') return false;
-  const expected = (process.env.MAKEFUN_SHOP_TOKEN ?? '').trim();
-  if (expected === '') return true;
-  return token === expected;
-}
-
-/** A fresh non-empty request id (deterministic: a counter). */
+/** A fresh request id from a shared counter object: `req-1`, `req-2`, ... */
 export function nextRequestId(seq: { value: number }): string {
   seq.value += 1;
   return `req-${seq.value}`;

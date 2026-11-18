@@ -1,23 +1,15 @@
-// Shared in-memory store for the forge: repositories, git objects, issues, pull
-// requests, labels and comments. One process, one Store, shared by the git smart
-// HTTP, REST v3, GraphQL and MCP surfaces, so an object created on one surface
-// reads back identically on the others.
+// The forge's single in-memory store: repositories, git objects, issues,
+// pull requests, labels and comments. One process, one Store, shared by the
+// git smart-HTTP, REST v3, GraphQL and MCP surfaces, so an object created on
+// one surface reads back identically on every other.
 //
-// Determinism (the replay rule): nothing in here reads a wall clock or an
+// Determinism (the replay rule): nothing here reads a wall clock or an
 // unseeded random source. Every timestamp comes from the logical Clock below,
-// which starts at the trial's now (MAKEFUN_TRIAL_NOW, the only now a request
-// may carry) and advances one second per mutation, so two runs that make the
-// same requests in the same order produce byte-identical state. Every id comes
-// from a counter. Git object ids are content hashes, deterministic by nature.
-
-/** The user the suite's bearer token names (the scenario's viewer; the seed is fixed in the kit's wire.ts). */
-export const VIEWER: User = Object.freeze({
-  id: 1000,
-  login: 'adaiversen',
-  name: 'ada iversen',
-  email: 'adaiversen@example.invalid',
-  type: 'User',
-} as const);
+// which starts at the trial's now (MAKEFUN_TRIAL_NOW — the only "now" a
+// request may carry) and advances one second per mutation, so two runs that
+// make the same requests in the same order produce byte-identical state.
+// Every id comes from a counter. Git object ids are content hashes, which
+// are deterministic by nature.
 
 export interface User {
   id: number;
@@ -26,6 +18,18 @@ export interface User {
   email: string;
   type: string;
 }
+
+/**
+ * The user the suite's bearer token names — the scenario's viewer.
+ * (The seed is fixed in the kit's wire.ts.)
+ */
+export const VIEWER: User = Object.freeze({
+  id: 1000,
+  login: 'adaiversen',
+  name: 'ada iversen',
+  email: 'adaiversen@example.invalid',
+  type: 'User',
+} as const);
 
 export type GitObjectType = 'commit' | 'tree' | 'blob' | 'tag';
 
@@ -121,28 +125,31 @@ export interface Repo {
   nextLabelId: number;
 }
 
-/** A monotonic logical clock: base time plus one second per mutation. */
+/** Fallback trial time when MAKEFUN_TRIAL_NOW is unset or unparsable. */
+const DEFAULT_TRIAL_NOW = '2026-11-14T06:30:00Z';
+
+/** A monotonic logical clock: a base time plus one second per mutation. */
 export class Clock {
   private readonly baseMs: number;
   private ticks = 0;
 
   constructor() {
-    const raw = (process.env.MAKEFUN_TRIAL_NOW ?? '').trim();
-    const parsed = raw === '' ? NaN : Date.parse(raw);
-    this.baseMs = Number.isFinite(parsed) ? parsed : Date.parse('2026-11-14T06:30:00Z');
+    const configured = (process.env.MAKEFUN_TRIAL_NOW ?? '').trim();
+    const parsed = configured === '' ? NaN : Date.parse(configured);
+    this.baseMs = Number.isFinite(parsed) ? parsed : Date.parse(DEFAULT_TRIAL_NOW);
   }
 
-  /** Current logical time without advancing (for reads). */
+  /** Current logical time as an ISO string, without advancing (for reads). */
   nowIso(): string {
     return new Date(this.baseMs + this.ticks * 1000).toISOString();
   }
 
-  /** Current logical time as a git timestamp (seconds since epoch, UTC). */
+  /** Current logical time as a git timestamp (epoch seconds, UTC). */
   nowUnix(): number {
     return Math.floor(this.baseMs / 1000) + this.ticks;
   }
 
-  /** Advance one second and return the new time (for mutations). */
+  /** Advance one second and return the new ISO time (for mutations). */
   tickIso(): string {
     this.ticks += 1;
     return this.nowIso();
@@ -155,6 +162,19 @@ export class Clock {
   }
 }
 
+/** GitHub's default label set for a fresh repository: name, color, description. */
+const DEFAULT_LABELS: ReadonlyArray<readonly [string, string, string]> = [
+  ['bug', 'd73a4a', "Something isn't working"],
+  ['documentation', '0075ca', 'Improvements or additions to documentation'],
+  ['duplicate', 'cfd3d7', 'This issue or pull request already exists'],
+  ['enhancement', 'a2eeef', 'New feature or request'],
+  ['good first issue', '7057ff', 'Good for newcomers'],
+  ['help wanted', '008672', 'Extra attention is needed'],
+  ['invalid', 'e4e669', "This doesn't seem right"],
+  ['question', 'd876e3', 'Further information is requested'],
+  ['wontfix', 'ffffff', 'This will not be worked on'],
+];
+
 export class Store {
   readonly clock = new Clock();
   /** 'owner/name' -> Repo. Only the viewer's repos exist; any other owner is 404. */
@@ -164,11 +184,15 @@ export class Store {
 
   /** A fresh global id (issues, pulls, comments, labels, users' objects). Deterministic. */
   nextGlobalId(): number {
-    return this.nextId++;
+    const id = this.nextId;
+    this.nextId += 1;
+    return id;
   }
 
   nextRepoIdValue(): number {
-    return this.nextRepoId++;
+    const id = this.nextRepoId;
+    this.nextRepoId += 1;
+    return id;
   }
 
   repoKey(owner: string, name: string): string {
@@ -179,20 +203,19 @@ export class Store {
     return this.repos.get(this.repoKey(owner, name));
   }
 
-  /** All repos owned by the viewer, in creation order. */
+  /** Every repo owned by the viewer, in creation order. */
   viewerRepos(): Repo[] {
-    const out: Repo[] = [];
-    for (const repo of this.repos.values()) if (repo.owner === VIEWER.login) out.push(repo);
-    return out;
+    return [...this.repos.values()].filter((repo) => repo.owner === VIEWER.login);
   }
 
   createRepo(name: string, description: string, isPrivate: boolean, defaultBranch: string): Repo {
     const now = this.clock.tickIso();
+    const owner = VIEWER.login;
     const repo: Repo = {
       id: this.nextRepoIdValue(),
-      owner: VIEWER.login,
+      owner,
       name,
-      full_name: `${VIEWER.login}/${name}`,
+      full_name: `${owner}/${name}`,
       description,
       private: isPrivate,
       fork: false,
@@ -200,8 +223,8 @@ export class Store {
       created_at: now,
       updated_at: now,
       pushed_at: now,
-      html_url: `https://github.com/${VIEWER.login}/${name}`,
-      url: `/api/v3/repos/${VIEWER.login}/${name}`,
+      html_url: `https://github.com/${owner}/${name}`,
+      url: `/api/v3/repos/${owner}/${name}`,
       objects: new Map(),
       refs: new Map(),
       issues: new Map(),
@@ -212,7 +235,7 @@ export class Store {
       nextCommentId: 1,
       nextLabelId: 1,
     };
-    this.repos.set(this.repoKey(repo.owner, name), repo);
+    this.repos.set(this.repoKey(owner, name), repo);
     return repo;
   }
 
@@ -220,27 +243,17 @@ export class Store {
     return this.repos.delete(this.repoKey(owner, name));
   }
 
-  /** The default labels a fresh repository carries (GitHub's set). */
+  /** Seed a fresh repository with GitHub's default labels. */
   defaultLabels(repo: Repo): void {
-    const defs: Array<[string, string, string]> = [
-      ['bug', 'd73a4a', "Something isn't working"],
-      ['documentation', '0075ca', 'Improvements or additions to documentation'],
-      ['duplicate', 'cfd3d7', 'This issue or pull request already exists'],
-      ['enhancement', 'a2eeef', 'New feature or request'],
-      ['good first issue', '7057ff', 'Good for newcomers'],
-      ['help wanted', '008672', 'Extra attention is needed'],
-      ['invalid', 'e4e669', 'This doesn\'t seem right'],
-      ['question', 'd876e3', 'Further information is requested'],
-      ['wontfix', 'ffffff', 'This will not be worked on'],
-    ];
-    for (const [name, color, description] of defs) {
-      repo.labels.set(name, {
+    for (const [name, color, description] of DEFAULT_LABELS) {
+      const label: Label = {
         id: repo.nextLabelId++,
         name,
         color,
         description,
         url: `/api/v3/repos/${repo.owner}/${repo.name}/labels/${encodeURIComponent(name)}`,
-      });
+      };
+      repo.labels.set(name, label);
     }
   }
 }
