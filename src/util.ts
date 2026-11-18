@@ -21,14 +21,32 @@ export function sha1(data: Buffer): string {
 
 /** The object id of a git object: sha1 of "<type> <size>\0" + content. */
 export function objectId(type: string, content: Buffer): string {
-  const header = Buffer.from(`${type} ${content.length}\0`, 'ascii');
-  const framed = Buffer.concat([header, content]);
-  return sha1(framed);
+  const hash = createHash('sha1');
+  hash.update(`${type} ${content.length}\0`, 'ascii');
+  hash.update(content);
+  return hash.digest('hex');
 }
 
 /** Inflate zlib-compressed bytes (loose objects and pack entries). */
 export function inflate(data: Buffer): Buffer {
   return inflateSync(data);
+}
+
+/**
+ * Inflate one zlib stream and report how many input bytes it consumed.
+ * `inflateSync` ignores trailing bytes, and with `{ info: true }` the
+ * engine reports exactly how many input bytes it consumed, so one inflate
+ * finds the stream's end — no trial-and-error, no thrown errors.
+ * Returns null when the engine does not report a usable length (then the
+ * caller falls back to the binary search).
+ */
+export function inflateCounted(data: Buffer): { data: Buffer; consumed: number } | null {
+  const { buffer, engine } = inflateSync(data, { info: true });
+  const consumed = (engine as unknown as { bytesWritten?: unknown }).bytesWritten;
+  if (typeof consumed !== 'number' || !Number.isFinite(consumed) || consumed <= 0 || consumed > data.length) {
+    return null;
+  }
+  return { data: buffer, consumed };
 }
 
 /** Deflate bytes with zlib (pack entries and loose objects). */
@@ -146,21 +164,28 @@ export function parseJsonBody(buf: Buffer): unknown {
 }
 
 /** The path portion of a request URL; '/' when the URL will not parse. */
-export function pathOf(req: IncomingMessage): string {
+const urlCache = new WeakMap<IncomingMessage, URL>();
+
+function parsedUrl(req: IncomingMessage): URL {
+  const cached = urlCache.get(req);
+  if (cached !== undefined) return cached;
+  let url: URL;
   try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
+    url = new URL(req.url ?? '/', 'http://entry');
   } catch {
-    return '/';
+    url = new URL('/', 'http://entry');
   }
+  urlCache.set(req, url);
+  return url;
+}
+
+export function pathOf(req: IncomingMessage): string {
+  return parsedUrl(req).pathname;
 }
 
 /** The query parameters of a request URL; empty when the URL will not parse. */
 export function queryOf(req: IncomingMessage): URLSearchParams {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').searchParams;
-  } catch {
-    return new URLSearchParams();
-  }
+  return parsedUrl(req).searchParams;
 }
 
 /** Percent-decode a single path segment; null when the escape is invalid. */

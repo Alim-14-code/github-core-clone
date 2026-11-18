@@ -25,6 +25,7 @@ import {
   decodeSegment,
   deflate,
   inflate,
+  inflateCounted,
   objectId,
   pathOf,
   pktLine,
@@ -169,8 +170,9 @@ function collectReachable(repo: Repo, roots: Iterable<string>, opts: ReachOption
   for (const root of roots) {
     if (OID_RE.test(root)) queue.push({ oid: root, gen: 0 });
   }
-  while (queue.length > 0) {
-    const item = queue.shift()!;
+  // Index pointer instead of shift(): the queue is a FIFO and shift() is O(n).
+  for (let head = 0; head < queue.length; head += 1) {
+    const item = queue[head];
     const oid = item.oid;
     if (seen.has(oid)) continue;
     const obj = repo.objects.get(oid);
@@ -292,14 +294,17 @@ function readOfsBase(buf: Buffer, start: number): { baseOffset: number; next: nu
 
 /**
  * Inflate one zlib stream starting at `offset` (bounded by `end`) and return
- * its bytes plus the offset just past the stream. `inflate` ignores trailing
- * bytes and throws on a truncated stream, so the stream's end is the
- * smallest prefix length that inflates successfully; find it by binary
- * search.
+ * its bytes plus the offset just past the stream. One inflate reports its
+ * own consumed length (see `inflateCounted`), so the stream's end is found
+ * without trial inflates. The binary search below is only the fallback for
+ * a runtime whose engine does not report the length; it throws exactly
+ * where the old code threw (a truncated stream).
  */
 function inflateAt(buf: Buffer, offset: number, end: number): { data: Buffer; next: number } {
   const max = end - offset;
   if (max <= 0) throw new Error('pack entry has no zlib stream');
+  const counted = inflateCounted(buf.subarray(offset, end));
+  if (counted !== null) return { data: counted.data, next: offset + counted.consumed };
   let lo = 1;
   let hi = max;
   let smallest = max;
@@ -551,15 +556,19 @@ function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-p
   return Buffer.concat(parts);
 }
 
-function v2Advertisement(): Buffer {
-  const lines = [
+/** The v2 capability advertisement never changes: build it once. */
+const V2_ADVERTISEMENT: Buffer = Buffer.concat(
+  [
     'version 2\n',
     `agent=${AGENT}\n`,
     'ls-refs=unborn\n',
     'fetch=shallow\n',
     'object-format=sha1\n',
-  ];
-  return Buffer.concat([...lines.map((line) => pktLine(line)), FLUSH]);
+  ].map((line) => pktLine(line)),
+);
+
+function v2Advertisement(): Buffer {
+  return Buffer.concat([V2_ADVERTISEMENT, FLUSH]);
 }
 
 // ---------------------------------------------------------------------------

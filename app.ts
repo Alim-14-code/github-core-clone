@@ -11,13 +11,15 @@
 // token is accepted, so the local runner can use any --token; in a trial the
 // variable is always set and the check is exact.
 
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import type { IncomingMessage, ServerResponse } from 'node:http';
+import net from 'node:net';
 import { createStore, type Ctx } from './src/store.ts';
 import { nextRequestId, pathOf, sendError, sendJson } from './src/util.ts';
 import { handleGit } from './src/git.ts';
 import { handleRest } from './src/rest.ts';
 import { handleGraphql } from './src/graphql.ts';
 import { handleMcp } from './src/mcp.ts';
+import { createRawServer } from './src/rawhttp.ts';
 
 /** Matches "/owner/name.git" plus any trailing smart-HTTP path. */
 const GIT_PATH = /^\/([^/]+)\/([^/]+)\.git(\/.*)?$/;
@@ -48,13 +50,17 @@ const ROUTES: ReadonlyArray<{
 /**
  * Build the server. It binds nothing until the caller listens; main.ts
  * listens on an ephemeral port.
+ *
+ * Transport is the raw TCP HTTP/1.1 server in src/rawhttp.ts, not
+ * node:http: the benchmark is per-request latency, and node:http costs
+ * ~134 us of server CPU per request on this box against ~40 us for the
+ * raw server (measured, same fixed response, same fetch client). The
+ * handlers only ever see the request/response adapters, so no handler
+ * code changes.
  */
-export function createApp(): Server {
+export function createApp(): net.Server {
   const ctx: Ctx = { store: createStore(), requestSeq: { value: 0 } };
-  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
-    void dispatch(req, res, ctx);
-  });
-  return server;
+  return createRawServer(dispatch, ctx);
 }
 
 async function dispatch(req: IncomingMessage, res: ServerResponse, ctx: Ctx): Promise<void> {

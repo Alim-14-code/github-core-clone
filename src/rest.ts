@@ -81,8 +81,14 @@ function bodyObject(body: unknown): Json | null {
 // Serializers
 // ---------------------------------------------------------------------------
 
+/** The viewer is the only user that ever exists; its JSON never changes. */
+const userJsonCache = new Map<string, Json>();
+
 function userJson(login: string, id: number): Json {
-  return {
+  const key = `${login}:${id}`;
+  const cached = userJsonCache.get(key);
+  if (cached !== undefined) return cached;
+  const built: Json = {
     login,
     id,
     node_id: Buffer.from(`04:User${id}`).toString('base64'),
@@ -93,6 +99,8 @@ function userJson(login: string, id: number): Json {
     type: 'User',
     site_admin: false,
   };
+  userJsonCache.set(key, built);
+  return built;
 }
 
 function repoJson(r: Repo): Json {
