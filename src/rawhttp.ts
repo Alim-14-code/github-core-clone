@@ -22,7 +22,6 @@
 
 import net from 'node:net';
 import { STATUS_CODES } from 'node:http';
-import { Readable } from 'node:stream';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
 /** Largest request body accepted, matching util.ts readBody's cap. */
@@ -34,34 +33,34 @@ const MAX_HEAD = 64 * 1024;
 // Request / response adapters (the only surface the handlers touch)
 // ---------------------------------------------------------------------------
 
-/** A request: method, url, headers, and the parsed body as a stream. */
-class RawRequest extends Readable {
+/** A request: method, url, headers, and the parsed body bytes.
+ *
+ * NOTE (R5): this is deliberately NOT a node:http Readable. Every handler
+ * reads the body through util.ts readBody, which returns the already-parsed
+ * `rawBody` buffer directly — no stream machinery, no extra tick, no copy.
+ * The only stream use of a request anywhere in the codebase is inside
+ * readBody itself, so nothing else needs Readable semantics. */
+class RawRequest {
   readonly method: string;
   readonly url: string;
   readonly headers: Record<string, string | string[]>;
   readonly socket: net.Socket;
+  readonly rawBody: Buffer;
 
   constructor(socket: net.Socket, method: string, url: string, headers: Record<string, string | string[]>, body: Buffer) {
-    super();
     this.socket = socket;
     this.method = method;
     this.url = url;
     this.headers = headers;
-    if (body.length > 0) this.push(body);
-    this.push(null);
+    this.rawBody = body;
   }
 
-  // _read is a no-op: the whole body was pushed in the constructor.
-  override _read(): void {}
-
-  override destroy(error?: Error): this {
-    // NOTE: deliberately does NOT destroy the socket. A Readable
-    // auto-destroys itself after 'end' (autoDestroy), and readBody's
-    // consumer path ends the stream on every POST — destroying the socket
-    // here would kill the connection before the response is written.
-    // Oversize bodies never reach readBody: the parser caps them and
-    // closes the socket itself (see tryParse / MAX_BODY).
-    super.destroy(error);
+  destroy(): this {
+    try {
+      this.socket.destroy();
+    } catch {
+      // already gone
+    }
     return this;
   }
 }
@@ -254,12 +253,15 @@ function tryParse(buf: Buffer, sendContinue: () => void): ParsedRequest | null {
   if (!Number.isFinite(length) || length < 0) throw new Error('bad content-length');
   if (length > MAX_BODY) throw new Error('request body too large');
   if (buf.length < bodyStart + length) return null;
+  // R5: the body is a view into the socket buffer, not a copy. The buffer
+  // is never mutated in place (new data is Buffer.concat'd into a fresh
+  // buffer, `rest` is a fresh view), so the view stays valid.
   return {
     method,
     target,
     version,
     headers,
-    body: length === 0 ? Buffer.alloc(0) : Buffer.from(buf.subarray(bodyStart, bodyStart + length)),
+    body: length === 0 ? Buffer.alloc(0) : buf.subarray(bodyStart, bodyStart + length),
     rest: buf.subarray(bodyStart + length),
     sentContinue: wantsContinue,
   };

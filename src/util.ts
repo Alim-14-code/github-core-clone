@@ -122,8 +122,20 @@ export function readPktLines(buf: Buffer): Array<PktLine> {
 // HTTP request helpers
 // ---------------------------------------------------------------------------
 
-/** Slurp a request body into a Buffer; rejects past `maxBytes` (default 256 MiB). */
+/** Slurp a request body into a Buffer; rejects past `maxBytes` (default 256 MiB).
+ *
+ * R5 fast path: the raw server already parsed the whole body, so a request
+ * carrying `rawBody` returns that buffer directly — no stream listeners, no
+ * extra tick, no copy. The stream path below is only the fallback for a
+ * real node:http request (never produced by this server).
+ */
 export function readBody(req: IncomingMessage, maxBytes = 256 * 1024 * 1024): Promise<Buffer> {
+  const fast = (req as unknown as { rawBody?: unknown }).rawBody;
+  if (Buffer.isBuffer(fast)) {
+    if (fast.length > maxBytes) return Promise.reject(new Error('request body too large'));
+    return Promise.resolve(fast);
+  }
+  if (typeof (req as unknown as { on?: unknown }).on !== 'function') return Promise.resolve(Buffer.alloc(0));
   return new Promise((resolve, reject) => {
     const pieces: Buffer[] = [];
     let seen = 0;
@@ -235,6 +247,9 @@ export function isHttpError(value: unknown): value is HttpError {
 /**
  * Answer with JSON. `extraHeaders` are merged beside content-type and
  * content-length. The body is always terminated with a newline.
+ *
+ * R5: the UTF-8 buffer is built once and its length is the content-length,
+ * so the string is encoded exactly once (no byteLength scan + re-encode).
  */
 export function sendJson(
   res: ServerResponse,
@@ -242,14 +257,14 @@ export function sendJson(
   body: unknown,
   extraHeaders: Record<string, string> = {},
 ): void {
-  const text = `${JSON.stringify(body)}\n`;
+  const buf = Buffer.from(`${JSON.stringify(body)}\n`, 'utf8');
   const headers: Record<string, string> = {
     'content-type': JSON_TYPE,
-    'content-length': String(Buffer.byteLength(text)),
+    'content-length': String(buf.length),
     ...extraHeaders,
   };
   res.writeHead(status, headers);
-  res.end(text);
+  res.end(buf);
 }
 
 /** Answer with a JSON `{message}` error body. */

@@ -84,6 +84,18 @@ function bodyObject(body: unknown): Json | null {
 /** The viewer is the only user that ever exists; its JSON never changes. */
 const userJsonCache = new Map<string, Json>();
 
+/** R5: node_ids are pure functions of (prefix, id); memoize the base64. */
+const nodeIdCache = new Map<string, string>();
+
+function nodeId(prefix: string, id: string | number): string {
+  const key = `${prefix}:${id}`;
+  const cached = nodeIdCache.get(key);
+  if (cached !== undefined) return cached;
+  const built = Buffer.from(`${prefix}${id}`).toString('base64');
+  nodeIdCache.set(key, built);
+  return built;
+}
+
 function userJson(login: string, id: number): Json {
   const key = `${login}:${id}`;
   const cached = userJsonCache.get(key);
@@ -166,7 +178,7 @@ function labelJson(l: Label): Json {
 function issueJson(r: Repo, i: Issue): Json {
   return {
     id: i.id,
-    node_id: Buffer.from(`01:Issue${i.id}`).toString('base64'),
+    node_id: nodeId('01:Issue', i.id),
     url: i.url,
     repository_url: r.url,
     labels_url: `${r.url}/labels{/name}`,
